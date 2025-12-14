@@ -1,0 +1,795 @@
+# step2_regular_maxpool.py (集成Voronoi注意力版本)
+
+import torch
+import torch.nn.functional as F
+from torch.nn import Linear
+from torch_geometric.loader import DenseDataLoader
+from torch_geometric.nn import DenseGraphConv, dense_mincut_pool
+from torch_geometric.data import InMemoryDataset
+import torch_geometric.transforms as T
+import os
+import shutil
+import numpy as np
+import datetime
+import csv
+import random
+import argparse
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+from scipy.spatial import Voronoi  # ★ 新增：用于Voronoi图计算
+
+## Hyperparameters
+Num_TCN = 8
+Num_Times = 10
+Num_Folds = 10
+Num_Epoch = 100
+Embedding_Dimension = 512
+LearningRate = 1e-4
+MiniBatchSize = 16
+beta = 0.90
+EarlyStopPatience = 15
+
+## 路径设置
+Step1_OutputRoot = "./Step1_Output/"
+MaxNumNodes_filename = os.path.join(Step1_OutputRoot, "MaxNumNodes.txt")
+max_nodes = np.loadtxt(MaxNumNodes_filename, dtype='int64', delimiter="\t").item()
+LastStep_OutputFolderName = Step1_OutputRoot
+
+# ---------------- GPU 选择 + TCN 紧凑正则参数 + Voronoi 注意力 ----------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--gpu", type=int, default=1,
+                    help="选择用于训练/推理的GPU编号（如 0 或 1）；若不可用自动回退到0或CPU")
+
+# ★ 新增：是否启用 TCN 空间紧凑正则
+parser.add_argument(
+    "--use_tcn_compact", type=int, default=1, choices=[0, 1],
+    help="是否启用 TCN 空间紧凑正则（1=启用，0=关闭），默认0"
+)
+
+# ★ 新增：TCN 空间紧凑正则系数 λ
+parser.add_argument(
+    "--lambda_tcn_compact", type=float, default=0.15,
+    help="TCN 空间紧凑正则系数 λ，默认 1e-3，仅在 use_tcn_compact=1 时生效"
+)
+
+# ★ 新增：是否使用 TCN 图级 mean+max pooling
+parser.add_argument(
+    "--use_tcn_max", type=int, default=1, choices=[0, 1],
+    help="是否在 TCN 图级读出时使用 mean+max pooling（1=启用, 0=仅使用 mean）"
+)
+
+# ★ 新增：是否使用 Voronoi 注意力（替换局部注意力）
+parser.add_argument(
+    "--use_voronoi_attention", type=int, default=1, choices=[0, 1],
+    help="是否使用 Voronoi 注意力（1=启用，0=使用原来的局部注意力），默认1"
+)
+
+args, _ = parser.parse_known_args()
+
+USE_TCN_COMPACT = bool(args.use_tcn_compact)
+LAMBDA_TCN_COMPACT = float(args.lambda_tcn_compact)
+USE_TCN_MAX = bool(args.use_tcn_max)
+USE_VORONOI_ATTENTION = bool(args.use_voronoi_attention)  # ★ 新增
+
+if torch.cuda.is_available():
+    cuda_count = torch.cuda.device_count()
+    gpu_id = args.gpu if 0 <= args.gpu < cuda_count else 0
+    try:
+        torch.cuda.set_device(gpu_id)
+    except Exception:
+        gpu_id = 0
+        torch.cuda.set_device(gpu_id)
+    device = torch.device(f"cuda:{gpu_id}")
+    print(f"[GPU] Using cuda:{gpu_id} - {torch.cuda.get_device_name(gpu_id)}")
+else:
+    device = torch.device("cpu")
+    print("[GPU] Using CPU (no CUDA available)")
+
+print(f"[TCN_Compact] enabled={USE_TCN_COMPACT}, lambda={LAMBDA_TCN_COMPACT}")
+print(f"[TCN_MaxPool] mean+max enabled={USE_TCN_MAX}")
+print(f"[VoronoiAttention] enabled={USE_VORONOI_ATTENTION}")  # ★ 新增
+
+
+# -------------------------------------------------
+
+
+class SpatialOmicsImageDataset(InMemoryDataset):
+    def __init__(self, root, transform=None, pre_transform=None):
+        super(SpatialOmicsImageDataset, self).__init__(root, transform, pre_transform)
+        self.data, self.slices = torch.load(self.processed_paths[0])
+
+    @property
+    def raw_file_names(self):
+        return []
+
+    @property
+    def processed_file_names(self):
+        return ['SpatialOmicsImageDataset.pt']
+
+    def download(self):
+        pass
+
+    def process(self):
+        raise RuntimeError(
+            f"processed file not found.\n"
+            f"期望的路径是: {self.processed_paths[0]}\n"
+            f"请先运行 Step1 生成该文件。"
+        )
+
+
+dataset = SpatialOmicsImageDataset(LastStep_OutputFolderName, transform=T.ToDense(max_nodes))
+
+
+# ---- 检查 Step1 生成的数据是否有 NaN/Inf（只打印一次） ----
+def check_dataset_for_nan(ds):
+    any_bad = False
+    for i, d in enumerate(ds):
+        for name, t in [('x', d.x), ('adj', getattr(d, "adj", None)),
+                        ('mask', getattr(d, "mask", None)), ('pos', getattr(d, "pos", None)), ('y', d.y)]:
+            if t is None:
+                continue
+            if not torch.isfinite(t).all():
+                print(f"[Check] sample {i}, tensor {name} has NaN/Inf.")
+                any_bad = True
+                break
+    if not any_bad:
+        print("[Check] Dataset tensors are all finite (no NaN / Inf).")
+
+
+check_dataset_for_nan(dataset)
+
+
+# ★ 新增：Voronoi注意力层（基础版本）
+# ★ 新增：Voronoi注意力层（融合约束版本：Voronoi 几何邻接 + pooled 邻接 A'）
+class VoronoiAttentionLayer(torch.nn.Module):
+    """
+    Voronoi-constrained attention on the pooled TCN graph.
+
+    输入:
+        x:         [B, K, F]   TCN 特征
+        positions: [B, K, 2]   TCN 质心坐标（由 soft assignment 加权得到）
+        adj_prior: [B, K, K]   pooled 邻接 A'（可选，来自 dense_mincut_pool 之后的 adj）
+                              用于与 Voronoi 邻接进行“融合约束”，而非直接替代。
+
+    输出:
+        out:        [B, K, F]  注意力聚合后的特征
+        alpha:      [B, K, K]  注意力权重
+        voronoi_adj:[B, K, K]  Voronoi 几何邻接（二值）
+        attn_adj:   [B, K, K]  实际用于注意力的融合邻接（二值）
+    """
+
+    def __init__(self, in_dim, out_dim, fallback_k=3, jitter_std=1e-4):
+        super(VoronoiAttentionLayer, self).__init__()
+        self.lin = Linear(in_dim, out_dim, bias=False)
+        self.attn = Linear(2 * out_dim, 1, bias=False)
+        self.leaky_relu = torch.nn.LeakyReLU(0.2)
+
+        self.fallback_k = int(fallback_k)
+        self.jitter_std = float(jitter_std)
+
+    @staticmethod
+    def _add_self_loops(mask_kk: torch.Tensor) -> torch.Tensor:
+        # mask_kk: [B,K,K] float/bool
+        B, K, _ = mask_kk.shape
+        eye = torch.eye(K, device=mask_kk.device, dtype=mask_kk.dtype).unsqueeze(0).expand(B, -1, -1)
+        return torch.maximum(mask_kk, eye)
+
+    def _knn_adjacency(self, pos_b: torch.Tensor, k: int) -> torch.Tensor:
+        """pos_b: [K,2] -> adj: [K,K] (0/1), symmetric, diag=0"""
+        K = pos_b.size(0)
+        if K <= 1:
+            return torch.zeros((K, K), device=pos_b.device, dtype=torch.float32)
+        k = max(1, min(int(k), K - 1))
+        dist = torch.cdist(pos_b, pos_b)  # [K,K]
+        # topk smallest distances, include self then drop it
+        _, idx = torch.topk(dist, k=k + 1, dim=1, largest=False)
+        adj = torch.zeros((K, K), device=pos_b.device, dtype=torch.float32)
+        for i in range(K):
+            nbr = idx[i, 1:]  # exclude self
+            adj[i, nbr] = 1.0
+            adj[nbr, i] = 1.0
+        adj.fill_diagonal_(0.0)
+        return adj
+
+    def construct_voronoi_adjacency(self, positions: torch.Tensor) -> torch.Tensor:
+        """positions: [B,K,2] -> voronoi_adj: [B,K,K] (0/1), symmetric, diag=0"""
+        batch_size, num_tcns, _ = positions.shape
+        out = torch.zeros(batch_size, num_tcns, num_tcns, device=positions.device, dtype=torch.float32)
+
+        for b in range(batch_size):
+            pos_b = positions[b]  # [K,2]
+            # 若 K<3，Voronoi 不可用：回退到全连接（不含自环）
+            if num_tcns < 3:
+                adj = torch.ones(num_tcns, num_tcns, device=positions.device, dtype=torch.float32)
+                adj.fill_diagonal_(0.0)
+                out[b] = adj
+                continue
+
+            # SciPy Voronoi 需要 CPU numpy
+            pos_np = pos_b.detach().cpu().numpy()
+
+            # 尝试 Voronoi；若退化则加微小 jitter 再试；仍失败则回退 kNN
+            success = False
+            for attempt in range(2):
+                try:
+                    if attempt == 1:
+                        pos_np = pos_np + np.random.normal(scale=self.jitter_std, size=pos_np.shape).astype(pos_np.dtype)
+                    vor = Voronoi(pos_np)
+                    adj_np = np.zeros((num_tcns, num_tcns), dtype=np.float32)
+
+                    # ridge_points 给出每条 Voronoi ridge 对应的两个 site（点）索引
+                    for (i, j) in vor.ridge_points:
+                        adj_np[i, j] = 1.0
+                        adj_np[j, i] = 1.0
+
+                    adj = torch.from_numpy(adj_np).to(positions.device)
+                    adj.fill_diagonal_(0.0)
+                    out[b] = adj
+                    success = True
+                    break
+                except Exception:
+                    success = False
+
+            if not success:
+                # 回退：kNN（k=3 或更小）
+                out[b] = self._knn_adjacency(pos_b, k=self.fallback_k)
+
+        return out
+
+    def fuse_adjacency(self, voronoi_adj: torch.Tensor, adj_prior) -> torch.Tensor:
+        """
+        融合策略（推荐，鲁棒）：
+            1) 首先取交集：M = 1_{A'>0} ∧ 1_{Vor>0}
+            2) 若某个节点在交集中“只有自环”，则对该节点放宽为并集：1_{A'>0} ∨ 1_{Vor>0}
+            3) 最终强制加入自环，避免 softmax 全 -inf/NaN
+        返回二值 mask: [B,K,K]
+        """
+        vor_mask = (voronoi_adj > 0).to(torch.float32)
+
+        if adj_prior is None:
+            fused = vor_mask
+        else:
+            pool_mask = (adj_prior > 0).to(torch.float32)
+            fused = vor_mask * pool_mask  # 交集
+
+        fused = self._add_self_loops(fused)
+
+        # 对“只有自环”的节点，放宽为并集（更不容易断图）
+        if adj_prior is not None:
+            pool_mask = (adj_prior > 0).to(torch.float32)
+            union = self._add_self_loops(torch.clamp(vor_mask + pool_mask, 0.0, 1.0))
+            deg = fused.sum(dim=-1)  # [B,K]
+            only_self = (deg <= 1.0 + 1e-6)  # 只有自环或近似
+            if only_self.any():
+                b_idx, i_idx = torch.where(only_self)
+                fused[b_idx, i_idx, :] = union[b_idx, i_idx, :]
+
+        return fused
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor, adj_prior=None):
+        B, K, _ = x.shape
+
+        # 1) 线性变换
+        h = self.lin(x)  # [B,K,F]
+
+        # 2) Voronoi 几何邻接
+        voronoi_adj = self.construct_voronoi_adjacency(positions)  # [B,K,K]
+
+        # 3) 融合约束（Voronoi + pooled A'）
+        attn_adj = self.fuse_adjacency(voronoi_adj, adj_prior)  # [B,K,K] in {0,1}
+
+        # 4) 注意力打分
+        Fh = h.size(-1)
+        h_i = h.unsqueeze(2).expand(B, K, K, Fh)
+        h_j = h.unsqueeze(1).expand(B, K, K, Fh)
+        a_input = torch.cat([h_i, h_j], dim=-1)  # [B,K,K,2F]
+        e = self.leaky_relu(self.attn(a_input).squeeze(-1))  # [B,K,K]
+
+        # 5) 掩膜（非融合邻接边置极小值）
+        e = e.masked_fill(attn_adj == 0, -1e9)
+
+        # 6) softmax 得到权重并聚合
+        alpha = torch.softmax(e, dim=-1)  # [B,K,K]
+        out = torch.matmul(alpha, h)      # [B,K,F]
+
+        return out, alpha, voronoi_adj, attn_adj
+
+
+# ★ 保留原来的局部注意力层（作为备选）
+class LocalGATLayer(torch.nn.Module):
+    """
+    局部注意力层：只在邻居上做注意力聚合
+    x:   [B, N, F]
+    adj: [B, N, N]
+    """
+
+    def __init__(self, in_dim, out_dim):
+        super(LocalGATLayer, self).__init__()
+        self.lin = Linear(in_dim, out_dim, bias=False)
+        self.attn = Linear(2 * out_dim, 1, bias=False)
+        self.leaky_relu = torch.nn.LeakyReLU(0.2)
+
+    def forward(self, x, adj, mask=None, pos=None):
+        B, N, F = x.shape
+        h = self.lin(x)  # [B, N, F]
+
+        # pair-wise 拼接
+        h_i = h.unsqueeze(2).expand(-1, -1, N, -1)  # [B, N, N, F]
+        h_j = h.unsqueeze(1).expand(-1, N, -1, -1)  # [B, N, N, F]
+        a_input = torch.cat([h_i, h_j], dim=-1)  # [B, N, N, 2F]
+
+        e = self.leaky_relu(self.attn(a_input).squeeze(-1))  # [B, N, N]
+
+        if adj is not None:
+            mask_adj = (adj > 0)
+            e = e.masked_fill(~mask_adj, -1e9)
+
+        alpha = torch.softmax(e, dim=-1)  # [B, N, N]
+        out = torch.matmul(alpha, h)  # [B, N, F]
+        return out
+
+
+class Net(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, hidden_channels=Embedding_Dimension):
+        super(Net, self).__init__()
+
+        self.conv1 = DenseGraphConv(in_channels, hidden_channels)
+        num_cluster1 = Num_TCN  # This is a hyperparameter.
+        self.pool1 = Linear(hidden_channels, num_cluster1)
+
+        self.conv3 = DenseGraphConv(hidden_channels, hidden_channels)
+
+        # ★ 根据参数选择使用Voronoi注意力或局部注意力
+        self.use_voronoi_attention = USE_VORONOI_ATTENTION
+        if self.use_voronoi_attention:
+            self.voronoi_attention = VoronoiAttentionLayer(hidden_channels, hidden_channels)
+        else:
+            self.local_gat = LocalGATLayer(hidden_channels, hidden_channels)
+
+        # ★ 新增：TCN 图级 mean+max pooling 开关
+        self.use_tcn_max = USE_TCN_MAX
+        if self.use_tcn_max:
+            # 将 concat 后的 2F 压回 F，保持后续结构不变
+            self.graph_in = Linear(hidden_channels * 2, hidden_channels)
+        else:
+            self.graph_in = None
+
+        self.lin1 = Linear(hidden_channels, hidden_channels)
+        self.lin2 = Linear(hidden_channels, out_channels)
+
+        # ★ 新增：图级 dropout，帮助正则化
+        self.dropout = torch.nn.Dropout(p=0.3)
+
+    def forward(self, x, adj, mask=None):
+        # ---- 防御：把输入里的 NaN/Inf 清掉 ----
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+        adj = torch.nan_to_num(adj, nan=0.0, posinf=0.0, neginf=0.0)
+        if mask is not None:
+            mask = torch.nan_to_num(mask, nan=0.0, posinf=1.0, neginf=0.0)
+
+                # ★ 第一步：提取节点坐标（用于 TCN 质心与 Voronoi 融合约束）
+        # 说明：坐标必须来自 data.pos（ToDense 后应为 [B,N,2]）；若缺失则退化为随机坐标并给出告警。
+        if pos is None:
+            if not hasattr(self, "_warned_no_pos"):
+                print("[Warn] `pos` is None (data.pos not provided). Voronoi fusion / compactness may degrade; using random coordinates.")
+                self._warned_no_pos = True
+            B0, N0, _ = x.shape
+            node_positions = torch.rand(B0, N0, 2, device=x.device)
+        else:
+            node_positions = pos
+            if node_positions.dim() == 2:
+                node_positions = node_positions.unsqueeze(0)
+            node_positions = node_positions.to(x.device).float()
+            if mask is not None and node_positions.shape[:2] == mask.shape:
+                node_positions = node_positions * mask.unsqueeze(-1).float()
+
+        x = F.relu(self.conv1(x, adj, mask))
+        s = self.pool1(x)  # here s is a non-softmax tensor.
+
+        x, adj, mc1, o1 = dense_mincut_pool(x, adj, s, mask)
+
+        # ---- MinCut 的输出也强制 finite ----
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+        mc1 = torch.nan_to_num(mc1, nan=0.0, posinf=0.0, neginf=0.0)
+        o1 = torch.nan_to_num(o1, nan=0.0, posinf=0.0, neginf=0.0)
+
+        ClusterAssignTensor_1 = torch.nan_to_num(s, nan=0.0, posinf=1e6, neginf=-1e6)
+        ClusterAdjTensor_1 = torch.nan_to_num(adj, nan=0.0, posinf=0.0, neginf=0.0)
+
+        x = self.conv3(x, adj)
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        # ★ 在图级 pool 前做注意力聚合
+        # 计算TCN的空间坐标（基于原始节点坐标和分配矩阵）
+        B, K, F = x.shape
+        _, N, _ = s.shape
+
+        # 使用soft assignment计算每个TCN的加权平均坐标
+                # 使用 soft assignment 计算每个 TCN 的加权平均坐标（padding 节点通过 mask 剔除）
+        S = torch.softmax(s, dim=-1)  # [B, N, K]
+        if mask is not None:
+            S = S * mask.unsqueeze(-1).float()  # padding 节点权重置 0
+
+        num = (S.unsqueeze(-1) * node_positions.unsqueeze(2)).sum(dim=1)  # [B, K, 2]
+        denom = S.sum(dim=1).unsqueeze(-1) + 1e-6                         # [B, K, 1]
+        tcn_positions = num / denom                                       # [B, K, 2]
+
+        # ★ 应用Voronoi注意力或局部注意力
+        if self.use_voronoi_attention:
+            # 使用Voronoi注意力
+            x, attention_weights, voronoi_adj, attn_adj = self.voronoi_attention(x, tcn_positions, adj_prior=adj)
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+
+            # 保存Voronoi邻接矩阵用于分析
+            self.voronoi_adj_saved = voronoi_adj
+            self.attn_adj_saved = attn_adj  # 融合约束后用于注意力的邻接
+        else:
+            # 使用原来的局部注意力
+            x = self.local_gat(x, adj, mask=None)
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        # --------- 图级读出：mean 或 mean+max（由开关决定）---------
+        if self.use_tcn_max:
+            x_mean = x.mean(dim=1)  # [B, F]
+            x_max, _ = x.max(dim=1)  # [B, F]
+            x_mean = torch.nan_to_num(x_mean, nan=0.0, posinf=1e6, neginf=-1e6)
+            x_max = torch.nan_to_num(x_max, nan=0.0, posinf=1e6, neginf=-1e6)
+            x_graph = torch.cat([x_mean, x_max], dim=-1)  # [B, 2F]
+            x_graph = self.graph_in(x_graph)  # [B, F]
+            x_graph = torch.nan_to_num(x_graph, nan=0.0, posinf=1e6, neginf=-1e6)
+        else:
+            x_graph = x.mean(dim=1)
+            x_graph = torch.nan_to_num(x_graph, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        x = self.dropout(x_graph)  # ★ drop 一次
+        x = F.relu(self.lin1(x))
+        x = self.dropout(x)  # ★ 再 drop 一次
+        x = self.lin2(x)
+        out = F.log_softmax(x, dim=-1)
+        out = torch.nan_to_num(out, nan=-1e2, posinf=1e2, neginf=-1e2)
+
+        return out, mc1, o1, ClusterAssignTensor_1, ClusterAdjTensor_1
+
+
+# ---------- 新增：TCN 空间紧凑正则 ----------
+def tcn_compact_loss(cluster_assign, pos, mask):
+    """
+    cluster_assign: [B, N, K]  （dense_mincut_pool 之前 pool1 的输出 s）
+    pos           : [B, N, 2]  （节点坐标）
+    mask          : [B, N]     （有效节点 =1，padding=0）
+    """
+    if (pos is None) or (cluster_assign is None):
+        # 返回 0，不影响总 loss
+        return cluster_assign.new_tensor(0.0)
+
+    # 保证类型
+    pos = torch.nan_to_num(pos, nan=0.0, posinf=0.0, neginf=0.0)
+    mask_f = mask.unsqueeze(-1).float()  # [B, N, 1]
+
+    # 图内坐标归一化到 [0,1]
+    very_pos = torch.full_like(pos, 1e9)
+    very_neg = torch.full_like(pos, -1e9)
+    pos_min = torch.where(mask_f > 0.5, pos, very_pos).min(dim=1, keepdim=True).values  # [B,1,2]
+    pos_max = torch.where(mask_f > 0.5, pos, very_neg).max(dim=1, keepdim=True).values  # [B,1,2]
+    pos_norm = (pos - pos_min) / (pos_max - pos_min + 1e-6)
+    pos_norm = torch.nan_to_num(pos_norm, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # soft assignment
+    S = torch.softmax(cluster_assign, dim=-1)  # [B, N, K]
+    S = S * mask_f  # padding 节点权重为 0
+
+    # 计算每个 TCN 的重心 μ_k
+    # pos_norm: [B, N, 2] -> [B, N, 1, 2]
+    pos_exp = pos_norm.unsqueeze(2)  # [B, N, 1, 2]
+    S_exp = S.unsqueeze(-1)  # [B, N, K, 1]
+    num = (S_exp * pos_exp).sum(dim=1)  # [B, K, 2]
+    denom = S.sum(dim=1).unsqueeze(-1)  # [B, K, 1]
+    denom = denom + 1e-6
+    mu = num / denom  # [B, K, 2]
+
+    # 节点到对应 TCN 重心的平方距离
+    mu_exp = mu.unsqueeze(1)  # [B, 1, K, 2]
+    diff = pos_exp - mu_exp  # [B, N, K, 2]
+    dist2 = (diff ** 2).sum(dim=-1)  # [B, N, K]
+
+    # 加权平均距离（每个 TCN 内部）
+    num2 = (S * dist2).sum(dim=1)  # [B, K]
+    denom2 = S.sum(dim=1) + 1e-6  # [B, K]
+    compact_per_tcn = num2 / denom2  # [B, K]
+
+    loss = compact_per_tcn.mean()  # 标量
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+    return loss
+
+
+# ----------------------------------------------------
+
+
+def train(epoch):
+    model.train()
+    loss_all = 0.0
+    loss_CE_all = 0.0
+    loss_MinCut_all = 0.0
+    loss_Compact_all = 0.0  # ★ 新增
+    n_samples = 0
+    skipped_batches = 0  # 本 epoch 被跳过的 batch 数
+
+    for data in train_loader:
+        data = data.to(device)
+        bs = data.y.size(0)
+        optimizer.zero_grad()
+        out, mc_loss, o_loss, cluster_assign, _ = model(data.x, data.adj, data.mask, getattr(data, 'pos', None))
+
+        # forward 里如果出现 NaN，直接跳过该 batch
+        if torch.isnan(out).any() or torch.isnan(mc_loss) or torch.isnan(o_loss):
+            print(f"[Warn] epoch {epoch}: NaN in forward, skip this batch.")
+            skipped_batches += 1
+            continue
+
+        loss_CE = F.nll_loss(out, data.y.view(-1))
+        loss_MinCut = mc_loss + o_loss
+
+        if torch.isnan(loss_CE) or torch.isnan(loss_MinCut):
+            print(f"[Warn] epoch {epoch}: NaN in loss (CE/MinCut), skip this batch.")
+            skipped_batches += 1
+            continue
+
+        # ★ 计算 TCN 空间紧凑正则
+        if USE_TCN_COMPACT:
+            # 注意：这里需要从data中获取节点坐标
+            if hasattr(data, 'pos'):
+                loss_Compact = tcn_compact_loss(cluster_assign, data.pos, data.mask)
+            else:
+                loss_Compact = out.new_tensor(0.0)
+                if epoch == 1:
+                    print("[Info] No position data found, setting compact loss to 0.")
+        else:
+            loss_Compact = out.new_tensor(0.0)
+
+        if torch.isnan(loss_Compact):
+            print(f"[Warn] epoch {epoch}: NaN in compact loss, set to 0.")
+            loss_Compact = out.new_tensor(0.0)
+
+        # 总 loss
+        loss = loss_CE * (1 - beta) + loss_MinCut * beta + LAMBDA_TCN_COMPACT * loss_Compact
+        loss.backward()
+
+        # 梯度裁剪，避免一次性冲飞
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+
+        optimizer.step()
+
+        loss_all += bs * loss.item()
+        loss_CE_all += bs * loss_CE.item()
+        loss_MinCut_all += bs * loss_MinCut.item()
+        loss_Compact_all += bs * loss_Compact.item()
+        n_samples += bs
+
+    if n_samples == 0:
+        print(f"[Warn] epoch {epoch}: ALL batches skipped due to NaN; return zero loss.")
+        return 0.0, 0.0, 0.0, 0.0, skipped_batches
+
+    avg_loss = loss_all / n_samples
+    avg_ce = loss_CE_all / n_samples
+    avg_mincut = loss_MinCut_all / n_samples
+    avg_compact = loss_Compact_all / n_samples
+
+    # 如果平均 CE 损失非常大，也打印一下提示
+    if avg_ce > 50:
+        print(f"[Warn] epoch {epoch}: very large CE loss ({avg_ce:.4f}).")
+
+    return avg_loss, avg_ce, avg_mincut, avg_compact, skipped_batches
+
+
+@torch.no_grad()
+def test(loader):
+    model.eval()
+    correct = 0
+    pr_Table = np.zeros((0, dataset.num_classes + 2))  # initializing an array.
+
+    all_probs = []
+    all_labels = []
+
+    for data in loader:
+        data = data.to(device)
+        ModelResultPr = model(data.x, data.adj, data.mask, getattr(data, 'pos', None))[0]
+        ModelResultPr = torch.nan_to_num(ModelResultPr, nan=-1e2, posinf=1e2, neginf=-1e2)
+
+        pred = ModelResultPr.max(dim=1)[1]
+        correct += pred.eq(data.y.view(-1)).sum().item()
+
+        probs_np = torch.exp(ModelResultPr).detach().cpu().numpy()
+        pred_np = pred.detach().cpu().numpy()
+        y_np = data.y.view(-1).detach().cpu().numpy()
+
+        all_probs.append(probs_np)
+        all_labels.append(y_np)
+
+        pred_info = np.column_stack(
+            (probs_np, pred_np.reshape(-1, 1), y_np.reshape(-1, 1)))
+        pr_Table = np.row_stack((pr_Table, pred_info))  # cat by rows.
+
+    test_acc = correct / len(loader.dataset)
+
+    # 计算 TestAUC（若类别不齐或出错则返回 None）
+    test_auc = None
+    try:
+        if len(all_probs) > 0 and dataset.num_classes == 2:
+            probs_all = np.vstack(all_probs)
+            labels_all = np.concatenate(all_labels)
+            if len(np.unique(labels_all)) == 2:
+                # 默认取第1类的概率作为正类分数
+                y_score = probs_all[:, 1]
+                test_auc = roc_auc_score(labels_all, y_score)
+    except Exception as e:
+        print(f"[Warn] AUC computation failed: {e}")
+
+    return test_acc, test_auc, pr_Table
+
+
+print(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+ThisStep_OutputFolderName = "./Step2_Output/"
+os.makedirs(ThisStep_OutputFolderName, exist_ok=True)
+
+# 预先取出所有图的标签，供 StratifiedKFold 使用
+labels = np.array([int(d.y.item()) for d in dataset])
+
+for num_time in range(1, Num_Times + 1):  # 10 times of k-fold cross-validation.
+    print(f'This is time: {num_time:02d}')
+    TimeFolderName = ThisStep_OutputFolderName + "Time" + str(num_time)
+    if os.path.exists(TimeFolderName):
+        shutil.rmtree(TimeFolderName)
+    os.makedirs(TimeFolderName)  # Creating the Time folder.
+
+    print(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+    # ★ 随机 K 折，不按 patient 分组，只按图的标签做 StratifiedKFold
+    skf = StratifiedKFold(
+        n_splits=Num_Folds,
+        shuffle=True,
+        random_state=1000 + num_time  # 每次 time 不同随机种子
+    )
+
+    for num_fold, (train_idx, test_idx) in enumerate(skf.split(np.zeros(len(labels)), labels), start=1):
+        train_list = train_idx.tolist()
+        test_list = test_idx.tolist()
+
+        print(f'This is fold: {num_fold:02d}, TestSamples: {test_list}')
+        test_dataset = dataset[test_list]
+        train_dataset = dataset[train_list]
+        train_loader = DenseDataLoader(train_dataset, batch_size=MiniBatchSize, shuffle=True)
+        test_loader = DenseDataLoader(test_dataset, batch_size=1)
+
+        model = Net(dataset.num_features, dataset.num_classes).to(device)  # Initialize model for each fold.
+        # ★ 加上 weight_decay 作为 L2 正则
+        optimizer = torch.optim.Adam(model.parameters(), lr=LearningRate, weight_decay=5e-4)
+
+        FoldFolderName = TimeFolderName + "/Fold" + str(num_fold)
+        os.makedirs(FoldFolderName)  # Creating the Fold folder.
+
+        # ★ 新增：保存Voronoi邻接矩阵的文件夹
+        if USE_VORONOI_ATTENTION:
+            voronoi_folder = FoldFolderName + "/Voronoi_Adj"
+            os.makedirs(voronoi_folder, exist_ok=True)
+
+        filename_0 = FoldFolderName + "/Epoch_TrainLoss.csv"
+        # ★ header 多一列 TrainLoss_Compact
+        headers_0 = ["Epoch", "TrainLoss", "TestAccuracy", "TestAUC",
+                     "TrainLoss_CE", "TrainLoss_MinCut", "TrainLoss_Compact", "SkippedBatches"]
+        with open(filename_0, "w", newline='') as f0:
+            f0_csv = csv.writer(f0)
+            f0_csv.writerow(headers_0)
+
+        # ★ early stopping 相关变量
+        best_metric = None  # 优先用 AUC，其次用 Acc
+        best_epoch = 0
+        best_state = None
+        epochs_no_improve = 0
+
+        for epoch in range(1, Num_Epoch + 1):  # Specify the number of epoch for training in each fold.
+            train_loss, train_loss_CE, train_loss_MinCut, train_loss_Compact, skipped_batches = train(epoch)
+            test_acc, test_auc, test_pr_tmp = test(test_loader)
+
+            metric = test_auc if test_auc is not None else test_acc
+
+            if (best_metric is None) or (metric > best_metric + 1e-4):
+                best_metric = metric
+                best_epoch = epoch
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+
+            print(f"[Epoch {epoch:03d}] "
+                  f"TrainLoss={train_loss:.4f}, CE={train_loss_CE:.4f}, "
+                  f"MinCut={train_loss_MinCut:.4f}, Compact={train_loss_Compact:.4f}, "
+                  f"TestAcc={test_acc:.4f}, "
+                  f"TestAUC={test_auc if test_auc is not None else float('nan'):.4f}, "
+                  f"Skipped={skipped_batches}")
+
+            with open(filename_0, "a", newline='') as f0:
+                f0_csv = csv.writer(f0)
+                f0_csv.writerow([
+                    epoch,
+                    train_loss,
+                    test_acc,
+                    test_auc if test_auc is not None else -1,
+                    train_loss_CE,
+                    train_loss_MinCut,
+                    train_loss_Compact,
+                    skipped_batches
+                ])
+
+            if epochs_no_improve >= EarlyStopPatience:
+                print(f"[EarlyStop] Fold {num_fold:02d}: no improvement for "
+                      f"{EarlyStopPatience} epochs. "
+                      f"BestEpoch={best_epoch:03d}, BestMetric={best_metric:.4f}")
+                break
+
+        # ---------- 使用最佳 epoch 的模型 ----------
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        final_test_acc, final_test_auc, final_test_pr = test(test_loader)
+
+        print(
+            f"Best epoch {best_epoch:03d}: final test accuracy = {final_test_acc:.4f}, "
+            f"final test AUC = {final_test_auc if final_test_auc is not None else float('nan'):.4f}"
+        )
+        filename6 = FoldFolderName + "/TestSet_Pr_Pred_Truth.csv"
+        np.savetxt(filename6, final_test_pr, delimiter=',')
+
+        # Extract the soft clustering matrix using the trained model of each fold.
+        all_sample_loader = DenseDataLoader(dataset, batch_size=1)
+        EachSample_num = 0
+
+        filename_5 = FoldFolderName + "/ModelPrediction.csv"
+        headers_5 = ["SampleNum", "PredictionCorrectFlag", "TrueLabel", "PredictedLabel"]
+        with open(filename_5, "w", newline='') as f5:
+            f5_csv = csv.writer(f5)
+            f5_csv.writerow(headers_5)
+
+        for EachData in all_sample_loader:
+            EachData = EachData.to(device)
+            TestModelResult = model(EachData.x, EachData.adj, EachData.mask)
+            PredLabel = TestModelResult[0].max(dim=1)[1]
+            CorrectFlag = PredLabel.eq(EachData.y.view(-1)).sum().item()
+
+            TrueLableArray = EachData.y.view(-1).detach().cpu().numpy()
+            PredLabelArray = PredLabel.detach().cpu().numpy()
+            with open(filename_5, "a", newline='') as f5:
+                f5_csv = csv.writer(f5)
+                f5_csv.writerow([EachSample_num, CorrectFlag, TrueLableArray, PredLabelArray])
+
+            ClusterAssignMatrix1 = TestModelResult[3][0, :, :]
+            ClusterAssignMatrix1 = torch.softmax(ClusterAssignMatrix1, dim=-1)
+            ClusterAssignMatrix1 = torch.nan_to_num(
+                ClusterAssignMatrix1, nan=0.0, posinf=1.0, neginf=0.0
+            )
+            ClusterAssignMatrix1 = ClusterAssignMatrix1.detach().cpu().numpy()
+            filename1 = FoldFolderName + "/ClusterAssignMatrix1_" + str(EachSample_num) + ".csv"
+            np.savetxt(filename1, ClusterAssignMatrix1, delimiter=',')
+
+            ClusterAdjMatrix1 = TestModelResult[4][0, :, :]
+            ClusterAdjMatrix1 = torch.nan_to_num(
+                ClusterAdjMatrix1, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            ClusterAdjMatrix1 = ClusterAdjMatrix1.detach().cpu().numpy()
+            filename2 = FoldFolderName + "/ClusterAdjMatrix1_" + str(EachSample_num) + ".csv"
+            np.savetxt(filename2, ClusterAdjMatrix1, delimiter=',')
+
+            NodeMask = EachData.mask.detach().cpu().numpy()
+            filename3 = FoldFolderName + "/NodeMask_" + str(EachSample_num) + ".csv"
+            np.savetxt(filename3, NodeMask.T, delimiter=',', fmt='%i')  # save as integers.
+
+            # ★ 新增：保存Voronoi邻接矩阵（如果使用Voronoi注意力）
+            if USE_VORONOI_ATTENTION and hasattr(model, 'voronoi_adj_saved'):
+                VoronoiAdjMatrix = model.voronoi_adj_saved[0, :, :].detach().cpu().numpy()
+                filename4 = voronoi_folder + "/VoronoiAdjMatrix_" + str(EachSample_num) + ".csv"
+                np.savetxt(filename4, VoronoiAdjMatrix, delimiter=',')
+
+            EachSample_num = EachSample_num + 1
+
+    print(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+print(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
